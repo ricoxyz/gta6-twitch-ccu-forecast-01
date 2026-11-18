@@ -23,6 +23,13 @@ EU_ONLY_LANGS = frozenset({
     "fr", "de", "it", "pl", "ru", "tr", "nl", "sv", "cs", "uk", "ro", "hu", "el", "fi", "da", "no",
 })
 
+# Keywords identifying multiplayer/live-service launches so single-player console launches align cleanly.
+MP_KEYWORDS = (
+    "call of duty", "battlefield", "multiplayer", "live-service", "forza",
+    "diablo", "borderlands", "monster hunter", "halo", "rivals",
+    "helldivers", "marathon", "arc raiders", "nightreign",
+)
+
 
 _ORD_CACHE: dict[str, int] = {}
 
@@ -166,6 +173,41 @@ def quad_form(x: list[float], M: list[list[float]]) -> float:
     return max(0.0, total)
 
 
+def weighted_median(vals: list[float], weights: list[float]) -> float:
+    """Compute continuous midpoint weighted median."""
+    pairs = sorted(zip(vals, weights), key=lambda item: item[0])
+    tot = sum(w for _, w in pairs)
+    if tot <= 0.0:
+        return pairs[len(pairs) // 2][0]
+    cum = 0.0
+    prev_v, prev_p = pairs[0][0], 0.0
+    for v, w in pairs:
+        p_mid = (cum + 0.5 * w) / tot
+        if 0.5 <= p_mid:
+            if p_mid <= prev_p:
+                return v
+            return prev_v + (0.5 - prev_p) / (p_mid - prev_p) * (v - prev_v)
+        prev_v, prev_p = v, p_mid
+        cum += w
+    return pairs[-1][0]
+
+
+def weighted_huber_loc(vals: list[float], weights: list[float], delta: float = 0.25, iters: int = 8) -> float:
+    """Weighted Huber M-estimator initialized at the weighted median (robust to outlier launches)."""
+    mu = weighted_median(vals, weights)
+    for _ in range(iters):
+        num = 0.0
+        den = 0.0
+        for v, w in zip(vals, weights):
+            err = abs(v - mu)
+            hw = w if err <= delta else w * (delta / err)
+            num += hw * v
+            den += hw
+        if den > 0.0:
+            mu = num / den
+    return mu
+
+
 def shift_dst_curve(y: dict[int, float], src_dst: bool, tgt_dst: bool) -> dict[int, float]:
     """Align a comparable's 23-hour log-ratio curve between EDT (DST=True) and EST (DST=False)."""
     if src_dst == tgt_dst:
@@ -239,6 +281,11 @@ def extract_record(
         or ("pc 10 am" in ul)
     )
     is_f2p = ("free-to-play" in ul) or ("f2p" in ul)
+    name_low = name.lower()
+    is_mp = any(k in name_low or k in ul or k in pl for k in MP_KEYWORDS)
+    if "single-player" in ul or "single player" in ul or "grand theft auto vi" in name_low:
+        is_mp = False
+    is_sp = not is_mp
 
     y: dict[int, float] = {}
     for h in range(2, 25):
@@ -276,6 +323,7 @@ def extract_record(
         "is_sim_pc_mid": is_sim_pc_mid,
         "is_sim_pc_later": is_sim_pc_later,
         "is_f2p": is_f2p,
+        "is_sp": is_sp,
         "regime": regime,
         "y": y,
         "A": A,
@@ -461,7 +509,7 @@ def forecast_case(case: dict[str, Any], name: str = "case") -> dict[str, Any]:
         q_map = fallback_forecast(tgt["v0"], tgt["dst"])
         return {"hours": [{"hour": row["hour"], "q": q_map[row["hour"]]} for row in case["forecast"]]}
 
-    # --- 1. LEVEL MODEL: regime-deconfounded ridge for daily mean log-ratio A ---
+    # --- 1. MODEL B: Regime-deconfounded Level + Shape Ridge with Bayesian Predictive Variance ---
     t_reg = tgt["regime"]
     t_sat_lv0 = soft_sat_log_v0(tgt["log_v0"])
 
@@ -492,28 +540,56 @@ def forecast_case(case: dict[str, Any], name: str = "case") -> dict[str, Any]:
 
     w_lvl: list[float] = []
     w_shp: list[float] = []
+    w_ker: list[float] = []
     for c in pool:
         r = c["regime"]
         wl = reg_w_lvl.get((t_reg, r), 1.0 if t_reg == r else 0.18)
         ws = reg_w_shp.get((t_reg, r), 1.0 if t_reg == r else 0.10)
-        d_eve = (tgt["r_eve"] - c["r_eve"]) / 1.15
-        d_v0 = (t_sat_lv0 - soft_sat_log_v0(c["log_v0"])) / 2.40
-        d_late = (tgt["r_late"] - c["r_late"]) / 0.90
-        wl *= math.exp(-0.5 * (d_eve * d_eve + d_v0 * d_v0))
-        ws *= math.exp(-0.5 * (d_eve * d_eve + 0.5 * d_late * d_late + 0.4 * d_v0 * d_v0))
+        if t_reg == "console_rolling":
+            wk = {"console_rolling": 6.0, "multi_rolling": 2.2, "pc_mid": 0.55, "pc_later": 0.08, "ea": 0.12}.get(r, 0.12)
+        elif t_reg == "multi_rolling":
+            wk = {"multi_rolling": 5.5, "console_rolling": 2.8, "pc_mid": 0.35, "pc_later": 0.10, "ea": 0.20}.get(r, 0.15)
+        else:
+            wk = 3.0 if r == t_reg else 0.30
+
+        # Single-player vs multiplayer audience affinity bonus.
+        if tgt["is_sp"] == c["is_sp"]:
+            wl *= 1.30
+            ws *= 1.30
+            wk *= 1.35
+
+        c_sat_lv0 = soft_sat_log_v0(c["log_v0"])
+        d_eve_b = (tgt["r_eve"] - c["r_eve"]) / 1.15
+        d_v0_b = (t_sat_lv0 - c_sat_lv0) / 2.40
+        d_late_b = (tgt["r_late"] - c["r_late"]) / 0.90
+        wl *= math.exp(-0.5 * (d_eve_b * d_eve_b + d_v0_b * d_v0_b))
+        ws *= math.exp(-0.5 * (d_eve_b * d_eve_b + 0.5 * d_late_b * d_late_b + 0.4 * d_v0_b * d_v0_b))
+
+        d_eve_a = (tgt["r_eve"] - c["r_eve"]) / 0.85
+        d_v0_a = (t_sat_lv0 - c_sat_lv0) / 1.40
+        d_late_a = (tgt["r_late"] - c["r_late"]) / 0.85
+        wk *= math.exp(-0.5 * (d_eve_a * d_eve_a + d_v0_a * d_v0_a + 0.4 * d_late_a * d_late_a))
+
         w_lvl.append(max(wl, 1e-6))
         w_shp.append(max(ws, 1e-6))
+        w_ker.append(max(wk, 1e-6))
 
     sw_lvl = sum(w_lvl)
     wn_lvl = [w / sw_lvl for w in w_lvl]
     sw_shp = sum(w_shp)
     wn_shp = [w / sw_shp for w in w_shp]
+    sw_ker = sum(w_ker)
+    wn_ker = [w / sw_ker for w in w_ker]
+
     n_eff_lvl = 1.0 / sum(w * w for w in wn_lvl)
     n_eff_shp = 1.0 / sum(w * w for w in wn_shp)
-    dof = math.sqrt(n_eff_shp / max(1.8, n_eff_shp - 2.2))
+    n_eff_ker = 1.0 / sum(w * w for w in wn_ker)
+    dof_b = math.sqrt(n_eff_shp / max(1.8, n_eff_shp - 2.2))
+    dof_a = math.sqrt(n_eff_ker / max(1.5, n_eff_ker - 1.5))
 
     # Clamp extreme pre-launch outliers before linear design matrix.
     c_reves = [clamp(c["r_eve"], -1.0, 1.5) for c in pool]
+    c_reves_a = [clamp(c["r_eve"], -0.8, 1.4) for c in pool]
     c_lv0s = [soft_sat_log_v0(c["log_v0"]) for c in pool]
     c_rlate = [clamp(c["r_late"], -1.0, 1.0) for c in pool]
     c_cons_roll = [1.0 if c["regime"] == "console_rolling" else 0.0 for c in pool]
@@ -542,7 +618,7 @@ def forecast_case(case: dict[str, Any], name: str = "case") -> dict[str, Any]:
     A_hat = sum(b * xv for b, xv in zip(beta_A, x_tgt_lvl))
     lev_lvl = quad_form(x_tgt_lvl, A_inv_lvl) / max(1.0, n_eff_lvl)
 
-    # --- 2. SHAPE MODEL: DST-aligned zero-mean curve S(h) on archetype-matched weights ---
+    # Align all comparable trajectories to the target's EDT/EST timezone once for both models.
     shifted_y: list[dict[int, float]] = []
     shifted_S: list[dict[int, float]] = []
     for c in pool:
@@ -564,46 +640,77 @@ def forecast_case(case: dict[str, Any], name: str = "case") -> dict[str, Any]:
     ]
     x_tgt_shp = [1.0, ts_eve, ts_lv0, ts_late]
 
-    mu_by_h: dict[int, float] = {}
-    sig_by_h: dict[int, float] = {}
+    mu_b: dict[int, float] = {}
+    sig_b: dict[int, float] = {}
+    mu_a: dict[int, float] = {}
+    sig_a: dict[int, float] = {}
+    t_reve_a = clamp(tgt["r_eve"], -0.8, 1.4)
 
+    # --- 2. JOINT HOURLY PASS: Model B (Bayesian Ridge) + Model A (Dual-Anchor Huber Shape Transfer) ---
     for h in range(2, 25):
+        yh = [sy[h] for sy in shifted_y]
+
+        # Model B: Decomposed Level + Shape Ridge
         sh = [s[h] for s in shifted_S]
         beta_S, A_inv_shp = solve_ridge_with_inv(X_shp, sh, wn_shp, [1e-6, 0.90, 2.20, 1.30])
         S_hat = sum(b * xv for b, xv in zip(beta_S, x_tgt_shp))
 
-        yh = [sy[h] for sy in shifted_y]
         le = 0.60 * (4.0 if h <= 5 else (1.5 if h <= 9 else 1.0))
         ll = 1.20 * (0.6 if h <= 5 else 2.5)
         beta_dir, _ = solve_ridge_with_inv(X_shp, yh, wn_shp, [1e-6, le, 1.60, ll])
         mu_dir = sum(b * xv for b, xv in zip(beta_dir, x_tgt_shp))
 
-        # Near-term hours (h=2..4) blend direct anchor with Level+Shape so h=2 stays tightly anchored to v1.
         w_m1 = 0.25 if h == 2 else (0.50 if h == 3 else (0.70 if h == 4 else 1.0))
-        mu_by_h[h] = w_m1 * (A_hat + S_hat) + (1.0 - w_m1) * mu_dir
+        mu_b[h] = w_m1 * (A_hat + S_hat) + (1.0 - w_m1) * mu_dir
 
-        # Robust finite-sample scale estimate inflated by exact Bayesian predictive leverage.
-        mae_sum = 0.0
-        rms_sum = 0.0
+        mae_b = 0.0
+        rms_b = 0.0
         for i in range(len(pool)):
             p1 = sum(b * xv for b, xv in zip(beta_A, X_lvl[i])) + sum(b * xv for b, xv in zip(beta_S, X_shp[i]))
             p2 = sum(b * xv for b, xv in zip(beta_dir, X_shp[i]))
             err = yh[i] - (w_m1 * p1 + (1.0 - w_m1) * p2)
             wi = wn_shp[i]
-            mae_sum += wi * abs(err)
-            rms_sum += wi * min(err * err, 0.85 * 0.85)
-        w_mae = mae_sum * 1.2533141373155
-        w_rms = math.sqrt(rms_sum)
-        base_sig = (0.50 * w_mae + 0.50 * w_rms) * dof
+            mae_b += wi * abs(err)
+            rms_b += wi * min(err * err, 0.85 * 0.85)
+        base_sig_b = (0.50 * (mae_b * 1.2533141373155) + 0.50 * math.sqrt(rms_b)) * dof_b
         lev_shp = quad_form(x_tgt_shp, A_inv_shp) / max(1.0, n_eff_shp)
         lev_tot = min(1.5, w_m1 * w_m1 * lev_lvl + 0.40 * lev_shp)
-        sig_by_h[h] = math.sqrt(max(0.015, base_sig * base_sig * (1.0 + lev_tot))) * 1.05
+        sig_b[h] = math.sqrt(max(0.015, base_sig_b * base_sig_b * (1.0 + lev_tot)))
+
+        # Model A: Non-parametric Dual-Anchor Huber Shape Transfer (ramps Day-1 evening anchor h=6..16)
+        alpha = 0.0 if h <= 6 else (0.45 if h >= 16 else 0.45 * (h - 6) / 10.0)
+        zs = [yh[i] - alpha * c_reves_a[i] for i in range(len(pool))]
+        z_hat = weighted_huber_loc(zs, wn_ker, delta=0.25)
+        mu_a[h] = z_hat + alpha * t_reve_a
+
+        mae_a = 0.0
+        rms_a = 0.0
+        for i, z_val in enumerate(zs):
+            err_a = z_val - z_hat
+            wi = wn_ker[i]
+            mae_a += wi * abs(err_a)
+            rms_a += wi * min(err_a * err_a, 0.85 * 0.85)
+        sig_a[h] = max(0.12, (0.55 * (mae_a * 1.2533141373155) + 0.45 * math.sqrt(rms_a)) * dof_a)
 
     # Gentle 3-point diurnal smoothing on smooth afternoon/evening hours (h=10..23) without blurring h=4..7 US unlock.
-    mu_smooth = dict(mu_by_h)
+    mu_a_s = dict(mu_a)
+    mu_b_s = dict(mu_b)
     for h in range(10, 24):
-        mu_smooth[h] = 0.70 * mu_by_h[h] + 0.15 * mu_by_h[h - 1] + 0.15 * mu_by_h[h + 1]
-    mu_by_h = mu_smooth
+        mu_a_s[h] = 0.70 * mu_a[h] + 0.15 * mu_a[h - 1] + 0.15 * mu_a[h + 1]
+        mu_b_s[h] = 0.70 * mu_b[h] + 0.15 * mu_b[h - 1] + 0.15 * mu_b[h + 1]
+    mu_a, mu_b = mu_a_s, mu_b_s
+
+    # Combine Model A (40%) + Model B (60%) via exact Law of Total Variance (aleatoric + epistemic disagreement).
+    w_a = 0.40
+    w_b = 1.0 - w_a
+    mu_by_h: dict[int, float] = {}
+    sig_by_h: dict[int, float] = {}
+    for h in range(2, 25):
+        mu_by_h[h] = w_a * mu_a[h] + w_b * mu_b[h]
+        var_ale = w_a * (sig_a[h] * sig_a[h]) + w_b * (sig_b[h] * sig_b[h])
+        diff = mu_a[h] - mu_b[h]
+        var_epi = w_a * w_b * (diff * diff)
+        sig_by_h[h] = math.sqrt(max(0.015, var_ale + var_epi)) * 1.06
 
     # --- 3. FINAL-CASE LIVE REFINEMENTS (bounded no-op on practice) ---
     exit_surprise, stream_adj, sat_scale = extract_live_refinements(case, tgt, mu_by_h[2])
