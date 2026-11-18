@@ -11,8 +11,8 @@ from datetime import date, datetime, timezone
 from typing import Any
 
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-# Student-t quantiles (df = 12) for slightly heavier-than-Gaussian finite-sample tails.
-T_QUANTILES = [-1.78229, -0.69548, 0.0, 0.69548, 1.78229]
+# Student-t quantiles (df = 10) for honest finite-sample tails against launch-day outliers.
+T_QUANTILES = [-1.81246, -0.69981, 0.0, 0.69981, 1.81246]
 
 VIEWER_FLOOR = 1.0
 QUANTILE_MIN = 0.01
@@ -98,13 +98,13 @@ def geom_mean(values: list[float], fallback: float) -> float:
     return math.exp(sum(math.log(v) for v in pos) / len(pos))
 
 
-def solve_ridge(
+def solve_ridge_with_inv(
     X: list[list[float]],
     y: list[float],
     w: list[float],
     lam: list[float],
-) -> list[float]:
-    """Solve weighted ridge regression (X^T W X + diag(lam)) beta = X^T W y via Gaussian elimination."""
+) -> tuple[list[float], list[list[float]]]:
+    """Solve weighted ridge (X^T W X + diag(lam)) beta = X^T W y and return (beta, A_inv)."""
     p = len(X[0])
     A = [[0.0] * p for _ in range(p)]
     b = [0.0] * p
@@ -120,36 +120,50 @@ def solve_ridge(
             A[j][k] = A[k][j]
         A[j][j] += lam[j]
 
-    M = [A[i] + [b[i]] for i in range(p)]
+    # Gauss-Jordan elimination on tiny p x p system (p <= 6) yields both beta and A_inv cleanly.
+    aug = [A[i] + [1.0 if i == j else 0.0 for j in range(p)] + [b[i]] for i in range(p)]
     for col in range(p):
         piv = col
-        best = abs(M[col][col])
+        best = abs(aug[col][col])
         for r in range(col + 1, p):
-            val = abs(M[r][col])
+            val = abs(aug[r][col])
             if val > best:
                 best = val
                 piv = r
         if piv != col:
-            M[col], M[piv] = M[piv], M[col]
-        denom = M[col][col]
+            aug[col], aug[piv] = aug[piv], aug[col]
+        denom = aug[col][col]
         if abs(denom) < 1e-12:
             continue
-        row_c = M[col]
-        for r in range(col + 1, p):
-            row_r = M[r]
-            factor = row_r[col] / denom
+        inv_d = 1.0 / denom
+        row_c = aug[col]
+        for c in range(col, 2 * p + 1):
+            row_c[c] *= inv_d
+        for r in range(p):
+            if r == col:
+                continue
+            row_r = aug[r]
+            factor = row_r[col]
             if factor == 0.0:
                 continue
-            for c in range(col, p + 1):
+            for c in range(col, 2 * p + 1):
                 row_r[c] -= factor * row_c[c]
 
-    beta = [0.0] * p
-    for i in range(p - 1, -1, -1):
-        rhs = M[i][p]
-        for j in range(i + 1, p):
-            rhs -= M[i][j] * beta[j]
-        beta[i] = rhs / M[i][i] if abs(M[i][i]) > 1e-12 else 0.0
-    return beta
+    A_inv = [aug[i][p:2 * p] for i in range(p)]
+    beta = [aug[i][2 * p] for i in range(p)]
+    return beta, A_inv
+
+
+def quad_form(x: list[float], M: list[list[float]]) -> float:
+    """Evaluate non-negative quadratic form x^T M x for Bayesian predictive leverage."""
+    total = 0.0
+    for j, xj in enumerate(x):
+        row = M[j]
+        s = 0.0
+        for k, xk in enumerate(x):
+            s += row[k] * xk
+        total += xj * s
+    return max(0.0, total)
 
 
 def shift_dst_curve(y: dict[int, float], src_dst: bool, tgt_dst: bool) -> dict[int, float]:
@@ -447,24 +461,26 @@ def forecast_case(case: dict[str, Any], name: str = "case") -> dict[str, Any]:
         q_map = fallback_forecast(tgt["v0"], tgt["dst"])
         return {"hours": [{"hour": row["hour"], "q": q_map[row["hour"]]} for row in case["forecast"]]}
 
-    # --- 1. LEVEL MODEL: regime-aware ridge for daily mean log-ratio A ---
+    # --- 1. LEVEL MODEL: regime-deconfounded ridge for daily mean log-ratio A ---
     t_reg = tgt["regime"]
     t_sat_lv0 = soft_sat_log_v0(tgt["log_v0"])
 
+    # Allow pc_mid mega-launches (Elden Ring, Cyberpunk) to inform mega-scale log_v0 slope
+    # while explicit regime dummies absorb their simultaneous-PC intercept shift cleanly.
     reg_w_lvl = {
         ("console_rolling", "console_rolling"): 6.0,
-        ("console_rolling", "multi_rolling"): 2.5,
-        ("console_rolling", "pc_mid"): 0.25,
+        ("console_rolling", "multi_rolling"): 2.8,
+        ("console_rolling", "pc_mid"): 0.50,
         ("console_rolling", "pc_later"): 0.08,
-        ("console_rolling", "ea"): 0.10,
+        ("console_rolling", "ea"): 0.15,
         ("multi_rolling", "multi_rolling"): 5.0,
         ("multi_rolling", "console_rolling"): 3.0,
-        ("multi_rolling", "pc_mid"): 0.30,
+        ("multi_rolling", "pc_mid"): 0.45,
         ("multi_rolling", "ea"): 0.20,
     }
     reg_w_shp = {
         ("console_rolling", "console_rolling"): 8.0,
-        ("console_rolling", "multi_rolling"): 2.0,
+        ("console_rolling", "multi_rolling"): 2.2,
         ("console_rolling", "pc_mid"): 0.08,
         ("console_rolling", "pc_later"): 0.05,
         ("console_rolling", "ea"): 0.08,
@@ -478,7 +494,7 @@ def forecast_case(case: dict[str, Any], name: str = "case") -> dict[str, Any]:
     w_shp: list[float] = []
     for c in pool:
         r = c["regime"]
-        wl = reg_w_lvl.get((t_reg, r), 1.0 if t_reg == r else 0.15)
+        wl = reg_w_lvl.get((t_reg, r), 1.0 if t_reg == r else 0.18)
         ws = reg_w_shp.get((t_reg, r), 1.0 if t_reg == r else 0.10)
         d_eve = (tgt["r_eve"] - c["r_eve"]) / 1.15
         d_v0 = (t_sat_lv0 - soft_sat_log_v0(c["log_v0"])) / 2.40
@@ -492,31 +508,39 @@ def forecast_case(case: dict[str, Any], name: str = "case") -> dict[str, Any]:
     wn_lvl = [w / sw_lvl for w in w_lvl]
     sw_shp = sum(w_shp)
     wn_shp = [w / sw_shp for w in w_shp]
-    n_eff = 1.0 / sum(w * w for w in wn_shp)
-    dof = math.sqrt(n_eff / max(1.8, n_eff - 2.2))
+    n_eff_lvl = 1.0 / sum(w * w for w in wn_lvl)
+    n_eff_shp = 1.0 / sum(w * w for w in wn_shp)
+    dof = math.sqrt(n_eff_shp / max(1.8, n_eff_shp - 2.2))
 
-    # Clamp extreme pre-launch outliers (e.g. simultaneous PC midnight launches) before linear design matrix.
+    # Clamp extreme pre-launch outliers before linear design matrix.
     c_reves = [clamp(c["r_eve"], -1.0, 1.5) for c in pool]
     c_lv0s = [soft_sat_log_v0(c["log_v0"]) for c in pool]
     c_rlate = [clamp(c["r_late"], -1.0, 1.0) for c in pool]
     c_cons_roll = [1.0 if c["regime"] == "console_rolling" else 0.0 for c in pool]
+    c_pcmid = [1.0 if c["regime"] == "pc_mid" else 0.0 for c in pool]
+    c_ea = [1.0 if c["regime"] == "ea" else 0.0 for c in pool]
 
     m_eve = sum(w * x for w, x in zip(wn_lvl, c_reves))
     m_lv0 = sum(w * x for w, x in zip(wn_lvl, c_lv0s))
     m_cons = sum(w * x for w, x in zip(wn_lvl, c_cons_roll))
+    m_pcm = sum(w * x for w, x in zip(wn_lvl, c_pcmid))
+    m_ea = sum(w * x for w, x in zip(wn_lvl, c_ea))
 
-    t_eve = clamp(tgt["r_eve"], min(c_reves) - 0.25, max(c_reves) + 0.25) - m_eve
-    t_lv0 = clamp(t_sat_lv0, min(c_lv0s) - 0.35, max(c_lv0s) + 0.35) - m_lv0
+    t_eve = clamp(tgt["r_eve"], min(c_reves) - 0.30, max(c_reves) + 0.30) - m_eve
+    t_lv0 = clamp(t_sat_lv0, min(c_lv0s) - 0.45, max(c_lv0s) + 0.45) - m_lv0
     t_cons = (1.0 if t_reg == "console_rolling" else 0.0) - m_cons
+    t_pcm = (1.0 if t_reg == "pc_mid" else 0.0) - m_pcm
+    t_ea = (1.0 if t_reg == "ea" else 0.0) - m_ea
 
     X_lvl = [
-        [1.0, e - m_eve, lv - m_lv0, co - m_cons]
-        for e, lv, co in zip(c_reves, c_lv0s, c_cons_roll)
+        [1.0, e - m_eve, lv - m_lv0, co - m_cons, pm - m_pcm, ea - m_ea]
+        for e, lv, co, pm, ea in zip(c_reves, c_lv0s, c_cons_roll, c_pcmid, c_ea)
     ]
-    x_tgt_lvl = [1.0, t_eve, t_lv0, t_cons]
+    x_tgt_lvl = [1.0, t_eve, t_lv0, t_cons, t_pcm, t_ea]
     y_A = [c["A"] for c in pool]
-    beta_A = solve_ridge(X_lvl, y_A, wn_lvl, [1e-6, 0.30, 0.70, 0.50])
+    beta_A, A_inv_lvl = solve_ridge_with_inv(X_lvl, y_A, wn_lvl, [1e-6, 0.22, 0.30, 0.40, 0.35, 0.35])
     A_hat = sum(b * xv for b, xv in zip(beta_A, x_tgt_lvl))
+    lev_lvl = quad_form(x_tgt_lvl, A_inv_lvl) / max(1.0, n_eff_lvl)
 
     # --- 2. SHAPE MODEL: DST-aligned zero-mean curve S(h) on archetype-matched weights ---
     shifted_y: list[dict[int, float]] = []
@@ -530,8 +554,8 @@ def forecast_case(case: dict[str, Any], name: str = "case") -> dict[str, Any]:
     ms_eve = sum(w * x for w, x in zip(wn_shp, c_reves))
     ms_lv0 = sum(w * x for w, x in zip(wn_shp, c_lv0s))
     ms_late = sum(w * x for w, x in zip(wn_shp, c_rlate))
-    ts_eve = clamp(tgt["r_eve"], min(c_reves) - 0.25, max(c_reves) + 0.25) - ms_eve
-    ts_lv0 = clamp(t_sat_lv0, min(c_lv0s) - 0.35, max(c_lv0s) + 0.35) - ms_lv0
+    ts_eve = clamp(tgt["r_eve"], min(c_reves) - 0.30, max(c_reves) + 0.30) - ms_eve
+    ts_lv0 = clamp(t_sat_lv0, min(c_lv0s) - 0.45, max(c_lv0s) + 0.45) - ms_lv0
     ts_late = clamp(tgt["r_late"], min(c_rlate) - 0.25, max(c_rlate) + 0.25) - ms_late
 
     X_shp = [
@@ -545,20 +569,20 @@ def forecast_case(case: dict[str, Any], name: str = "case") -> dict[str, Any]:
 
     for h in range(2, 25):
         sh = [s[h] for s in shifted_S]
-        beta_S = solve_ridge(X_shp, sh, wn_shp, [1e-6, 0.90, 2.20, 1.30])
+        beta_S, A_inv_shp = solve_ridge_with_inv(X_shp, sh, wn_shp, [1e-6, 0.90, 2.20, 1.30])
         S_hat = sum(b * xv for b, xv in zip(beta_S, x_tgt_shp))
 
         yh = [sy[h] for sy in shifted_y]
         le = 0.60 * (4.0 if h <= 5 else (1.5 if h <= 9 else 1.0))
         ll = 1.20 * (0.6 if h <= 5 else 2.5)
-        beta_dir = solve_ridge(X_shp, yh, wn_shp, [1e-6, le, 1.60, ll])
+        beta_dir, _ = solve_ridge_with_inv(X_shp, yh, wn_shp, [1e-6, le, 1.60, ll])
         mu_dir = sum(b * xv for b, xv in zip(beta_dir, x_tgt_shp))
 
         # Near-term hours (h=2..4) blend direct anchor with Level+Shape so h=2 stays tightly anchored to v1.
         w_m1 = 0.25 if h == 2 else (0.50 if h == 3 else (0.70 if h == 4 else 1.0))
         mu_by_h[h] = w_m1 * (A_hat + S_hat) + (1.0 - w_m1) * mu_dir
 
-        # Robust finite-sample scale estimate from weighted MAE + winsorized RMS residuals.
+        # Robust finite-sample scale estimate inflated by exact Bayesian predictive leverage.
         mae_sum = 0.0
         rms_sum = 0.0
         for i in range(len(pool)):
@@ -571,8 +595,15 @@ def forecast_case(case: dict[str, Any], name: str = "case") -> dict[str, Any]:
         w_mae = mae_sum * 1.2533141373155
         w_rms = math.sqrt(rms_sum)
         base_sig = (0.50 * w_mae + 0.50 * w_rms) * dof
-        extrap = 0.010 * (t_eve * t_eve + 0.25 * t_lv0 * t_lv0)
-        sig_by_h[h] = math.sqrt(max(0.014, base_sig * base_sig + extrap)) * 1.08
+        lev_shp = quad_form(x_tgt_shp, A_inv_shp) / max(1.0, n_eff_shp)
+        lev_tot = min(1.5, w_m1 * w_m1 * lev_lvl + 0.40 * lev_shp)
+        sig_by_h[h] = math.sqrt(max(0.015, base_sig * base_sig * (1.0 + lev_tot))) * 1.05
+
+    # Gentle 3-point diurnal smoothing on smooth afternoon/evening hours (h=10..23) without blurring h=4..7 US unlock.
+    mu_smooth = dict(mu_by_h)
+    for h in range(10, 24):
+        mu_smooth[h] = 0.70 * mu_by_h[h] + 0.15 * mu_by_h[h - 1] + 0.15 * mu_by_h[h + 1]
+    mu_by_h = mu_smooth
 
     # --- 3. FINAL-CASE LIVE REFINEMENTS (bounded no-op on practice) ---
     exit_surprise, stream_adj, sat_scale = extract_live_refinements(case, tgt, mu_by_h[2])
