@@ -199,6 +199,7 @@ def extract_record(
     pl = platforms.lower()
 
     is_ea = (("early-access" in ul) or ("early access" in ul)) and ("no early access" not in ul)
+    is_campaign_ea_only = "campaign early access" in ul
     ul_has_pc = (" pc" in ul or "(pc" in ul or "pc," in ul or "pc/" in ul or "steam" in ul) and (
         "pc 2019" not in ul and "no pc" not in ul
     )
@@ -231,6 +232,19 @@ def extract_record(
         if pt is not None and pt[0] is not None:
             y[h] = math.log(max(VIEWER_FLOOR, float(pt[0])) / v0)
 
+    r_eve = math.log(pre_eve_gm / v0)
+    # Classify launch regime cleanly so simultaneous-PC and multi-day EA launches do not confound rolling console launches.
+    if is_sim_pc_later:
+        regime = "pc_later"
+    elif is_sim_pc_mid or ((not is_console) and (r_eve < -1.0 or y.get(2, 0.0) > 0.35)):
+        regime = "pc_mid"
+    elif is_ea and (not is_campaign_ea_only):
+        regime = "ea"
+    elif is_console:
+        regime = "console_rolling"
+    else:
+        regime = "multi_rolling"
+
     A = (sum(y.values()) / len(y)) if len(y) == 23 else 0.0
     max_ratio = max((math.exp(v) for v in y.values()), default=1.0)
 
@@ -240,7 +254,7 @@ def extract_record(
         "v0": v0,
         "ch0": ch0,
         "log_v0": math.log(v0),
-        "r_eve": math.log(pre_eve_gm / v0),
+        "r_eve": r_eve,
         "r_late": math.log(v0 / late3_gm),
         "d1_jump": math.log(max(VIEWER_FLOOR, pre_eve_gm) / max(VIEWER_FLOOR, base_med)),
         "is_ea": is_ea,
@@ -248,6 +262,7 @@ def extract_record(
         "is_sim_pc_mid": is_sim_pc_mid,
         "is_sim_pc_later": is_sim_pc_later,
         "is_f2p": is_f2p,
+        "regime": regime,
         "y": y,
         "A": A,
         "max_ratio": max_ratio,
@@ -432,85 +447,78 @@ def forecast_case(case: dict[str, Any], name: str = "case") -> dict[str, Any]:
         q_map = fallback_forecast(tgt["v0"], tgt["dst"])
         return {"hours": [{"hour": row["hour"], "q": q_map[row["hour"]]} for row in case["forecast"]]}
 
-    # --- 1. LEVEL MODEL: predict daily mean log-ratio A across all active comparables ---
+    # --- 1. LEVEL MODEL: regime-aware ridge for daily mean log-ratio A ---
+    t_reg = tgt["regime"]
     t_sat_lv0 = soft_sat_log_v0(tgt["log_v0"])
+
+    reg_w_lvl = {
+        ("console_rolling", "console_rolling"): 6.0,
+        ("console_rolling", "multi_rolling"): 2.5,
+        ("console_rolling", "pc_mid"): 0.25,
+        ("console_rolling", "pc_later"): 0.08,
+        ("console_rolling", "ea"): 0.10,
+        ("multi_rolling", "multi_rolling"): 5.0,
+        ("multi_rolling", "console_rolling"): 3.0,
+        ("multi_rolling", "pc_mid"): 0.30,
+        ("multi_rolling", "ea"): 0.20,
+    }
+    reg_w_shp = {
+        ("console_rolling", "console_rolling"): 8.0,
+        ("console_rolling", "multi_rolling"): 2.0,
+        ("console_rolling", "pc_mid"): 0.08,
+        ("console_rolling", "pc_later"): 0.05,
+        ("console_rolling", "ea"): 0.08,
+        ("multi_rolling", "multi_rolling"): 6.0,
+        ("multi_rolling", "console_rolling"): 3.0,
+        ("multi_rolling", "pc_mid"): 0.15,
+        ("multi_rolling", "ea"): 0.15,
+    }
+
     w_lvl: list[float] = []
-    for c in pool:
-        w = 1.0
-        if tgt["is_console"]:
-            if c["is_console"]:
-                w *= 2.2
-            elif c["is_sim_pc_mid"]:
-                w *= 0.55
-            elif c["is_sim_pc_later"]:
-                w *= 0.20
-        elif tgt["is_sim_pc_later"] and c["is_sim_pc_later"]:
-            w *= 3.0
-        if (not tgt["is_ea"]) and c["is_ea"]:
-            w *= 0.45
-        elif tgt["is_ea"] and (not c["is_ea"]):
-            w *= 0.45
-        d_eve = (tgt["r_eve"] - c["r_eve"]) / 1.20
-        d_v0 = (t_sat_lv0 - soft_sat_log_v0(c["log_v0"])) / 2.20
-        w *= math.exp(-0.5 * (d_eve * d_eve + d_v0 * d_v0))
-        w_lvl.append(max(w, 1e-6))
-    sw_lvl = sum(w_lvl)
-    wn_lvl = [w / sw_lvl for w in w_lvl]
-
-    c_reves = [c["r_eve"] for c in pool]
-    c_lv0s = [soft_sat_log_v0(c["log_v0"]) for c in pool]
-    c_cons = [1.0 if c["is_console"] else 0.0 for c in pool]
-    c_ea = [1.0 if c["is_ea"] else 0.0 for c in pool]
-    c_spmid = [1.0 if c["is_sim_pc_mid"] else 0.0 for c in pool]
-    c_splat = [1.0 if c["is_sim_pc_later"] else 0.0 for c in pool]
-    c_rlate = [c["r_late"] for c in pool]
-
-    m_eve = sum(w * x for w, x in zip(wn_lvl, c_reves))
-    m_lv0 = sum(w * x for w, x in zip(wn_lvl, c_lv0s))
-    m_cons = sum(w * x for w, x in zip(wn_lvl, c_cons))
-    m_ea = sum(w * x for w, x in zip(wn_lvl, c_ea))
-    m_spmid = sum(w * x for w, x in zip(wn_lvl, c_spmid))
-    m_splat = sum(w * x for w, x in zip(wn_lvl, c_splat))
-
-    t_eve = clamp(tgt["r_eve"], min(c_reves) - 0.30, max(c_reves) + 0.30) - m_eve
-    t_lv0 = clamp(t_sat_lv0, min(c_lv0s) - 0.35, max(c_lv0s) + 0.35) - m_lv0
-    t_cons = (1.0 if tgt["is_console"] else 0.0) - m_cons
-    t_ea = (1.0 if tgt["is_ea"] else 0.0) - m_ea
-    t_spmid = (1.0 if tgt["is_sim_pc_mid"] else 0.0) - m_spmid
-    t_splat = (1.0 if tgt["is_sim_pc_later"] else 0.0) - m_splat
-
-    X_lvl = [
-        [1.0, e - m_eve, lv - m_lv0, co - m_cons, ea - m_ea, sm - m_spmid, sl - m_splat]
-        for e, lv, co, ea, sm, sl in zip(c_reves, c_lv0s, c_cons, c_ea, c_spmid, c_splat)
-    ]
-    x_tgt_lvl = [1.0, t_eve, t_lv0, t_cons, t_ea, t_spmid, t_splat]
-    y_A = [c["A"] for c in pool]
-    beta_A = solve_ridge(X_lvl, y_A, wn_lvl, [1e-6, 0.25, 0.35, 0.30, 0.35, 0.35, 0.35])
-    A_hat = sum(b * xv for b, xv in zip(beta_A, x_tgt_lvl))
-
-    # --- 2. SHAPE MODEL: DST-aligned zero-mean curve S(h) on archetype-matched weights ---
     w_shp: list[float] = []
     for c in pool:
-        w = 1.0
-        if tgt["is_console"]:
-            if c["is_console"]:
-                w *= 5.0
-            elif c["is_sim_pc_mid"] or c["is_sim_pc_later"]:
-                w *= 0.15
-        if (not tgt["is_ea"]) and c["is_ea"]:
-            w *= 0.25
-        elif tgt["is_ea"] and (not c["is_ea"]):
-            w *= 0.30
-        d_eve = (tgt["r_eve"] - c["r_eve"]) / 0.90
-        d_late = (tgt["r_late"] - c["r_late"]) / 0.80
-        d_v0 = (t_sat_lv0 - soft_sat_log_v0(c["log_v0"])) / 2.00
-        w *= math.exp(-0.5 * (d_eve * d_eve + 0.5 * d_late * d_late + 0.5 * d_v0 * d_v0))
-        w_shp.append(max(w, 1e-6))
+        r = c["regime"]
+        wl = reg_w_lvl.get((t_reg, r), 1.0 if t_reg == r else 0.15)
+        ws = reg_w_shp.get((t_reg, r), 1.0 if t_reg == r else 0.10)
+        d_eve = (tgt["r_eve"] - c["r_eve"]) / 1.15
+        d_v0 = (t_sat_lv0 - soft_sat_log_v0(c["log_v0"])) / 2.40
+        d_late = (tgt["r_late"] - c["r_late"]) / 0.90
+        wl *= math.exp(-0.5 * (d_eve * d_eve + d_v0 * d_v0))
+        ws *= math.exp(-0.5 * (d_eve * d_eve + 0.5 * d_late * d_late + 0.4 * d_v0 * d_v0))
+        w_lvl.append(max(wl, 1e-6))
+        w_shp.append(max(ws, 1e-6))
+
+    sw_lvl = sum(w_lvl)
+    wn_lvl = [w / sw_lvl for w in w_lvl]
     sw_shp = sum(w_shp)
     wn_shp = [w / sw_shp for w in w_shp]
     n_eff = 1.0 / sum(w * w for w in wn_shp)
-    dof = math.sqrt(n_eff / max(2.0, n_eff - 2.0))
+    dof = math.sqrt(n_eff / max(1.8, n_eff - 2.2))
 
+    # Clamp extreme pre-launch outliers (e.g. simultaneous PC midnight launches) before linear design matrix.
+    c_reves = [clamp(c["r_eve"], -1.0, 1.5) for c in pool]
+    c_lv0s = [soft_sat_log_v0(c["log_v0"]) for c in pool]
+    c_rlate = [clamp(c["r_late"], -1.0, 1.0) for c in pool]
+    c_cons_roll = [1.0 if c["regime"] == "console_rolling" else 0.0 for c in pool]
+
+    m_eve = sum(w * x for w, x in zip(wn_lvl, c_reves))
+    m_lv0 = sum(w * x for w, x in zip(wn_lvl, c_lv0s))
+    m_cons = sum(w * x for w, x in zip(wn_lvl, c_cons_roll))
+
+    t_eve = clamp(tgt["r_eve"], min(c_reves) - 0.25, max(c_reves) + 0.25) - m_eve
+    t_lv0 = clamp(t_sat_lv0, min(c_lv0s) - 0.35, max(c_lv0s) + 0.35) - m_lv0
+    t_cons = (1.0 if t_reg == "console_rolling" else 0.0) - m_cons
+
+    X_lvl = [
+        [1.0, e - m_eve, lv - m_lv0, co - m_cons]
+        for e, lv, co in zip(c_reves, c_lv0s, c_cons_roll)
+    ]
+    x_tgt_lvl = [1.0, t_eve, t_lv0, t_cons]
+    y_A = [c["A"] for c in pool]
+    beta_A = solve_ridge(X_lvl, y_A, wn_lvl, [1e-6, 0.30, 0.70, 0.50])
+    A_hat = sum(b * xv for b, xv in zip(beta_A, x_tgt_lvl))
+
+    # --- 2. SHAPE MODEL: DST-aligned zero-mean curve S(h) on archetype-matched weights ---
     shifted_y: list[dict[int, float]] = []
     shifted_S: list[dict[int, float]] = []
     for c in pool:
@@ -522,9 +530,9 @@ def forecast_case(case: dict[str, Any], name: str = "case") -> dict[str, Any]:
     ms_eve = sum(w * x for w, x in zip(wn_shp, c_reves))
     ms_lv0 = sum(w * x for w, x in zip(wn_shp, c_lv0s))
     ms_late = sum(w * x for w, x in zip(wn_shp, c_rlate))
-    ts_eve = clamp(tgt["r_eve"], min(c_reves) - 0.30, max(c_reves) + 0.30) - ms_eve
+    ts_eve = clamp(tgt["r_eve"], min(c_reves) - 0.25, max(c_reves) + 0.25) - ms_eve
     ts_lv0 = clamp(t_sat_lv0, min(c_lv0s) - 0.35, max(c_lv0s) + 0.35) - ms_lv0
-    ts_late = clamp(tgt["r_late"], min(c_rlate) - 0.30, max(c_rlate) + 0.30) - ms_late
+    ts_late = clamp(tgt["r_late"], min(c_rlate) - 0.25, max(c_rlate) + 0.25) - ms_late
 
     X_shp = [
         [1.0, e - ms_eve, lv - ms_lv0, lt - ms_late]
@@ -537,13 +545,13 @@ def forecast_case(case: dict[str, Any], name: str = "case") -> dict[str, Any]:
 
     for h in range(2, 25):
         sh = [s[h] for s in shifted_S]
-        beta_S = solve_ridge(X_shp, sh, wn_shp, [1e-6, 0.80, 2.00, 1.20])
+        beta_S = solve_ridge(X_shp, sh, wn_shp, [1e-6, 0.90, 2.20, 1.30])
         S_hat = sum(b * xv for b, xv in zip(beta_S, x_tgt_shp))
 
         yh = [sy[h] for sy in shifted_y]
-        le = 0.55 * (4.0 if h <= 5 else (1.5 if h <= 9 else 1.0))
+        le = 0.60 * (4.0 if h <= 5 else (1.5 if h <= 9 else 1.0))
         ll = 1.20 * (0.6 if h <= 5 else 2.5)
-        beta_dir = solve_ridge(X_shp, yh, wn_shp, [1e-6, le, 1.40, ll])
+        beta_dir = solve_ridge(X_shp, yh, wn_shp, [1e-6, le, 1.60, ll])
         mu_dir = sum(b * xv for b, xv in zip(beta_dir, x_tgt_shp))
 
         # Near-term hours (h=2..4) blend direct anchor with Level+Shape so h=2 stays tightly anchored to v1.
@@ -559,12 +567,12 @@ def forecast_case(case: dict[str, Any], name: str = "case") -> dict[str, Any]:
             err = yh[i] - (w_m1 * p1 + (1.0 - w_m1) * p2)
             wi = wn_shp[i]
             mae_sum += wi * abs(err)
-            rms_sum += wi * min(err * err, 0.81)
+            rms_sum += wi * min(err * err, 0.85 * 0.85)
         w_mae = mae_sum * 1.2533141373155
         w_rms = math.sqrt(rms_sum)
         base_sig = (0.50 * w_mae + 0.50 * w_rms) * dof
-        extrap = 0.008 * (t_eve * t_eve + 0.25 * t_lv0 * t_lv0)
-        sig_by_h[h] = math.sqrt(max(0.010, base_sig * base_sig + extrap)) * 1.02
+        extrap = 0.010 * (t_eve * t_eve + 0.25 * t_lv0 * t_lv0)
+        sig_by_h[h] = math.sqrt(max(0.014, base_sig * base_sig + extrap)) * 1.08
 
     # --- 3. FINAL-CASE LIVE REFINEMENTS (bounded no-op on practice) ---
     exit_surprise, stream_adj, sat_scale = extract_live_refinements(case, tgt, mu_by_h[2])
