@@ -1,0 +1,6 @@
+__pycache__/
+*.py[cod]
+out/
+*.tar.gz
+.env
+.DS_Store
